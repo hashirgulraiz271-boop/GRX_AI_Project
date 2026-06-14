@@ -10,7 +10,7 @@ from datetime import datetime
 app = Flask(__name__)
 CORS(app)
 
-# ─── Load Model ──────────────────────────────────────────────────────────────
+# ─── Load Model Assets With Absolute Directories ─────────────────────────────
 BASE = os.path.dirname(os.path.abspath(__file__))
 
 with open(os.path.join(BASE, 'model/knn_model.pkl'), 'rb') as f:
@@ -20,9 +20,14 @@ with open(os.path.join(BASE, 'model/scaler.pkl'), 'rb') as f:
 with open(os.path.join(BASE, 'model/encoders.pkl'), 'rb') as f:
     encoders = pickle.load(f)
 
-# ─── Database ────────────────────────────────────────────────────────────────
-DB_PATH = os.path.join(BASE, 'database/grx_ai.db')
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+# ─── Production Ready Database Configuration ─────────────────────────────────
+# Serverless platforms like Vercel have a read-only root system. 
+# We target the writeable '/tmp' directory so SQLite can initialize.
+if os.environ.get("VERCEL"):
+    DB_PATH = '/tmp/grx_ai.db'
+else:
+    DB_PATH = os.path.join(BASE, 'database/grx_ai.db')
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 def get_db():
     db = getattr(g, '_database', None)
@@ -50,7 +55,11 @@ def init_db():
     conn.commit()
     conn.close()
 
-init_db()
+# Safe Database initialization invocation
+try:
+    init_db()
+except Exception:
+    pass
 
 @app.teardown_appcontext
 def close_connection(exception):
@@ -66,7 +75,7 @@ def index():
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        data = request.get_json()
+        data = request.get_json() or {}
         weather    = data.get('weather')
         traffic    = data.get('traffic')
         time_day   = data.get('time_of_day')
@@ -74,7 +83,7 @@ def predict():
         distance   = int(data.get('distance', 10))
         route_type = data.get('route_type')
 
-        # Encode
+        # Feature Mapping Matrix Lookups
         w_enc  = encoders['weather'].get(weather, 0)
         tr_enc = encoders['traffic'].get(traffic, 0)
         t_enc  = encoders['time'].get(time_day, 0)
@@ -82,7 +91,6 @@ def predict():
         rt_enc = encoders['route_type'].get(route_type, 0)
 
         features = np.array([[w_enc, tr_enc, t_enc, ac_enc, distance, rt_enc]])
-
         feat_df = pd.DataFrame(features, columns=['W_num','Tr_num','T_num','Ac_num','Distance','Rt_num'])
         features_scaled = scaler.transform(feat_df)
 
@@ -91,17 +99,20 @@ def predict():
         confidence = float(max(pred_proba)) * 100
 
         prediction = encoders['label'].get(pred_num, 'Unknown')
+        formatted_prediction = prediction.replace('_', ' ')
 
-        # Save to DB
-        db = get_db()
-        db.execute('''
-            INSERT INTO predictions (weather, traffic, time_of_day, accident, distance, route_type, prediction, confidence, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (weather, traffic, time_day, accident, distance, route_type,
-              prediction, confidence, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-        db.commit()
+        # Safe DB insertion block
+        try:
+            db = get_db()
+            db.execute('''
+                INSERT INTO predictions (weather, traffic, time_of_day, accident, distance, route_type, prediction, confidence, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (weather, traffic, time_day, accident, distance, route_type,
+                  formatted_prediction, confidence, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+            db.commit()
+        except Exception:
+            pass
 
-        # Safety tips
         tips = {
             'Safe_Route':    'Great! This route appears safe. Enjoy your ride!',
             'Moderate_Risk': 'Be cautious! Some risks detected. Stay alert and follow traffic rules.',
@@ -110,7 +121,7 @@ def predict():
 
         return jsonify({
             'success': True,
-            'prediction': prediction.replace('_', ' '),
+            'prediction': formatted_prediction,
             'prediction_raw': prediction,
             'confidence': round(confidence, 1),
             'tip': tips.get(prediction, ''),
@@ -124,15 +135,13 @@ def predict():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-
 @app.route('/history', methods=['GET'])
 def history():
     try:
         db = get_db()
         rows = db.execute('SELECT * FROM predictions ORDER BY id DESC').fetchall()
         return jsonify([dict(r) for r in rows])
-    except Exception as e:
-        # Fallback: Returns an empty list safely instead of crashing the site
+    except Exception:
         return jsonify([])
 
 @app.route('/stats', methods=['GET'])
@@ -140,12 +149,11 @@ def stats():
     try:
         db = get_db()
         total = db.execute('SELECT COUNT(*) FROM predictions').fetchone()[0]
-        safe = db.execute("SELECT COUNT(*) FROM predictions WHERE safety_status = 'Safe Route'").fetchone()[0]
-        mod = db.execute("SELECT COUNT(*) FROM predictions WHERE safety_status = 'Moderate Risk'").fetchone()[0]
-        high = db.execute("SELECT COUNT(*) FROM predictions WHERE safety_status = 'High Risk'").fetchone()[0]
+        safe = db.execute("SELECT COUNT(*) FROM predictions WHERE prediction = 'Safe Route'").fetchone()[0]
+        mod = db.execute("SELECT COUNT(*) FROM predictions WHERE prediction = 'Moderate Risk'").fetchone()[0]
+        high = db.execute("SELECT COUNT(*) FROM predictions WHERE prediction = 'High Risk'").fetchone()[0]
         return jsonify({'total': total, 'safe': safe, 'moderate': mod, 'high': high})
-    except Exception as e:
-        # Fallback values so your frontend dashboard components don't break
+    except Exception:
         return jsonify({'total': 0, 'safe': 0, 'moderate': 0, 'high': 0})
 
 if __name__ == '__main__':
