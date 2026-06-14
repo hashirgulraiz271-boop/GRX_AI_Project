@@ -1,11 +1,9 @@
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "grx_ai_submission/app.py",
-      "use": "@vercel/python"
+  "functions": {
+    "grx_ai_submission/app.py": {
+      "runtime": "vercel-python@3.12"
     }
-  ],
+  },
   "routes": [
     {
       "src": "/(.*)",
